@@ -60,3 +60,13 @@ module "avm-res-web-site" {
 
 
 }
+
+
+  functionapp = {
+    MF-MDI-CC-GHPROD-DDDS-AFUNC = {
+      name                       = "MF-MDI-CC-GHPROD-DDDS-AFUNC"
+      kind                       = "functionapp"
+      storage_account_name       = "mfmdiccprodghcoresa"
+      
+    }
+  }
