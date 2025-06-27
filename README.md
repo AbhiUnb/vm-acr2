@@ -780,3 +780,54 @@ resource "azapi_update_resource" "minTlsCipherSuite" {
 }
 
 
+
+-----------------------------------
+abhinavsingh@Abhinav-Mac test % go get github.com/gruntwork-io/terratest/modules/terraform
+go: added github.com/agext/levenshtein v1.2.3
+go: added github.com/apparentlymart/go-textseg/v15 v15.0.0
+go: added github.com/bgentry/go-netrc v0.0.0-20140422174119-9fd32a8b3d3d
+go: added github.com/davecgh/go-spew v1.1.1
+go: added github.com/gruntwork-io/terratest v0.50.0
+go: added github.com/hashicorp/errwrap v1.0.0
+go: added github.com/hashicorp/go-cleanhttp v0.5.2
+go: added github.com/hashicorp/go-getter/v2 v2.2.3
+go: added github.com/hashicorp/go-multierror v1.1.1
+go: added github.com/hashicorp/go-safetemp v1.0.0
+go: added github.com/hashicorp/go-version v1.7.0
+go: added github.com/hashicorp/hcl/v2 v2.22.0
+go: added github.com/hashicorp/terraform-json v0.23.0
+go: added github.com/jinzhu/copier v0.0.0-20190924061706-b57f9002281a
+go: added github.com/klauspost/compress v1.16.5
+go: added github.com/mattn/go-zglob v0.0.2-0.20190814121620-e3c945676326
+go: added github.com/mitchellh/go-homedir v1.1.0
+go: added github.com/mitchellh/go-testing-interface v1.14.1
+go: added github.com/mitchellh/go-wordwrap v1.0.1
+go: added github.com/pmezard/go-difflib v1.0.0
+go: added github.com/stretchr/testify v1.10.0
+go: added github.com/tmccombs/hcl2json v0.6.4
+go: added github.com/ulikunitz/xz v0.5.10
+go: added github.com/zclconf/go-cty v1.15.0
+go: added golang.org/x/crypto v0.36.0
+go: added golang.org/x/mod v0.18.0
+go: added golang.org/x/net v0.38.0
+go: added golang.org/x/sync v0.12.0
+go: added golang.org/x/sys v0.31.0
+go: added golang.org/x/text v0.23.0
+go: added golang.org/x/tools v0.22.0
+go: added gopkg.in/yaml.v3 v3.0.1
+abhinavsingh@Abhinav-Mac test % go get github.com/gruntwork-io/terratest/modules/azure
+go: warning: github.com/Azure/go-autorest/autorest/adal@v0.9.13: retracted by module author: retracted due to token refresh errors
+go: to switch to the latest unretracted version, run:
+        go get github.com/Azure/go-autorest/autorest/adal@latest
+abhinavsingh@Abhinav-Mac test % go get github.com/gruntwork-io/terratest/modules/http-helper
+abhinavsingh@Abhinav-Mac test % go get github.com/stretchr/testify
+abhinavsingh@Abhinav-Mac test % go mod tidy
+go: downloading github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/managementgroups/armmanagementgroups v1.0.0
+go: downloading github.com/Azure/go-autorest/autorest/mocks v0.4.1
+abhinavsingh@Abhinav-Mac test % go mod init webapp-test                                     
+go: /Users/abhinavsingh/Documents/azure-webapp/test/go.mod already exists
+abhinavsingh@Abhinav-Mac test % go mod tidy                       
+abhinavsingh@Abhinav-Mac test % export RESOURCE_GROUP=MF_MDIxMI_TerraTest
+abhinavsingh@Abhinav-Mac test % go test -v
+
+
