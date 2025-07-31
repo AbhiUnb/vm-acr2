@@ -1,81 +1,97 @@
 import azure.functions as func
-import logging
 import json
+import logging
+from datetime import datetime
 import pyodbc
+
+# Azure SDK imports
 from azure.identity import ManagedIdentityCredential
 from azure.mgmt.managementgroups import ManagementGroupsAPI
 from azure.mgmt.resource import SubscriptionClient
 from azure.mgmt.compute import ComputeManagementClient
 
+# Configuration for DB connection
+DB_SERVER = "hjshjdfhsdjfhjhj.database.windows.net"
+DB_NAME = "metadata"
+DB_USERNAME = "rdsjkdataadmin"
+DB_PASSWORD = "ejhjhsrhjdhfjh"
+
+# User Assigned Managed Identity Client ID
+USER_ASSIGNED_CLIENT_ID = "YOUR-USER-ASSIGNED-MSI-CLIENT-ID"
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("Starting Azure Function to fetch VMs by MG -> Subs -> VMs using UAMI")
+    logging.info("Starting VM discovery via Management Groups")
 
     try:
-        # Step 1: Authenticate using User Assigned Managed Identity
-        USER_ASSIGNED_CLIENT_ID = "<your-user-assigned-client-id>"  # replace with your UAMI client ID
-        credential = ManagedIdentityCredential(client_id=USER_ASSIGNED_CLIENT_ID)
-
-        # Step 2: Connect to SQL DB and fetch Management Group IDs
+        # Connect to Azure SQL DB using username/password
         conn_str = (
             "Driver={ODBC Driver 17 for SQL Server};"
-            "Server=tcp:hjshjdfhsdjfhjhj.database.windows.net,1433;"
-            "Database=metadata;"
-            "Uid=rdsjkdataadmin;"
-            "Pwd=ejhjhsrhjdhfjh;"
+            f"Server={DB_SERVER};"
+            f"Database={DB_NAME};"
+            f"Uid={DB_USERNAME};"
+            f"Pwd={DB_PASSWORD};"
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
             "Connection Timeout=30;"
         )
 
-        mg_ids = []
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT mg_id FROM Management_Groups WHERE env_type = 'lower';")
-            for row in cursor.fetchall():
-                mg_ids.append(row.mg_id)
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        cursor.execute("SELECT mg_id FROM Managment_Groups WHERE env_type = 'lower'")
+        rows = cursor.fetchall()
+        mg_ids = [row.mg_id for row in rows]
 
-        # Step 3: Initialize clients
-        mgmt_group_client = ManagementGroupsAPI(credential)
+        logging.info(f"Fetched {len(mg_ids)} management groups from DB")
+
+        # Authenticate with UAMI
+        credential = ManagedIdentityCredential(client_id=USER_ASSIGNED_CLIENT_ID)
+        mg_client = ManagementGroupsAPI(credential)
         subscription_client = SubscriptionClient(credential)
 
-        vm_details = []
+        all_results = []
 
         for mg_id in mg_ids:
             try:
-                mg_details = mgmt_group_client.management_groups.get(group_id=mg_id, expand="children", recurse=True)
+                mg_details = mg_client.management_groups.get(group_id=mg_id, expand="children", recurse=True)
                 subscriptions = []
 
                 def extract_subscriptions(entity):
                     if entity.type == "/subscriptions":
                         subscriptions.append(entity.name)
-                    elif hasattr(entity, 'children') and entity.children:
+                    elif hasattr(entity, 'children'):
                         for child in entity.children:
                             extract_subscriptions(child)
 
-                if hasattr(mg_details, 'children') and mg_details.children:
+                if hasattr(mg_details, 'children'):
                     for child in mg_details.children:
                         extract_subscriptions(child)
 
-                # Step 4: For each subscription, get VMs
+                logging.info(f"MG {mg_id} has {len(subscriptions)} subscriptions")
+
                 for sub_id in subscriptions:
                     compute_client = ComputeManagementClient(credential, sub_id)
-                    for vm in compute_client.virtual_machines.list_all():
-                        vm_details.append({
+                    vms = compute_client.virtual_machines.list_all()
+                    for vm in vms:
+                        all_results.append({
                             "mg_id": mg_id,
                             "subscription_id": sub_id,
                             "vm_name": vm.name,
                             "resource_group": vm.id.split("/")[4],
-                            "location": vm.location,
-                            "vm_size": vm.hardware_profile.vm_size
+                            "location": vm.location
                         })
+            except Exception as e:
+                logging.error(f"Failed to fetch VMs for MG {mg_id}: {str(e)}")
 
-            except Exception as ex:
-                logging.warning(f"Skipping MG {mg_id} due to error: {str(ex)}")
-                continue
-
-        return func.HttpResponse(json.dumps(vm_details, indent=2), mimetype="application/json", status_code=200)
+        return func.HttpResponse(
+            json.dumps(all_results, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
 
     except Exception as e:
-        logging.error(f"Function error: {str(e)}")
-        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+        logging.error(f"Error in function: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
