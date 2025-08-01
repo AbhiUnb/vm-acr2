@@ -95,3 +95,61 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
+
+
+        -------------
+
+
+
+
+import azure.functions as func
+import os
+import pymssql
+import json
+import logging
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("🔍 Starting SQL connection test from Azure Function")
+
+    try:
+        # Fetch the connection string from Azure Function App Settings (under Application Settings)
+        conn_str = os.getenv("SQL_CONNECTION_STRING")
+        if not conn_str:
+            raise Exception("SQL_CONNECTION_STRING not found in environment variables")
+
+        # Parse the connection string manually
+        # Expected format: Server=tcp:<server>;Database=<db>;Uid=<user>;Pwd=<pass>;
+        parts = dict(item.split('=') for item in conn_str.split(';') if item)
+        server = parts.get("Server").replace("tcp:", "").strip()
+        database = parts.get("Database")
+        user = parts.get("Uid")
+        password = parts.get("Pwd")
+
+        # Connect to SQL DB using pymssql
+        conn = pymssql.connect(server=server, user=user, password=password, database=database)
+        cursor = conn.cursor()
+
+        # Run query to fetch MGs
+        query = "SELECT mg_id FROM Managment_Groups WHERE env_type = 'lower';"
+        cursor.execute(query)
+        mg_ids = [row[0] for row in cursor.fetchall()]
+
+        cursor.close()
+        conn.close()
+
+        logging.info(f"✅ Successfully fetched {len(mg_ids)} management groups")
+        return func.HttpResponse(
+            json.dumps({"mg_ids": mg_ids}, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"❌ Error: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
