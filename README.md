@@ -164,71 +164,40 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 --sd-s-s--s-s-----
-
 import azure.functions as func
-import logging
-import json
 import pymssql
+import logging
 from azure.identity import ManagedIdentityCredential
-from azure.mgmt.managementgroups import ManagementGroupsAPI
+import os
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("Starting VM analyzer with UAMI + DB string")
+    logging.info("Starting local DB + UAMI test...")
 
     try:
-        # Step 1: Auth with User Assigned Managed Identity (UAMI)
-        uami_client_id = "your-uami-client-id"  # <<--- put your UAMI client_id here
-        credential = ManagedIdentityCredential(client_id=uami_client_id)
-        mgmt_client = ManagementGroupsAPI(credential)
+        # (Optional) UAMI setup - not used here but ready for Azure APIs
+        client_id = os.environ.get("UAMI_CLIENT_ID")  # only required if you're testing with UAMI
+        credential = ManagedIdentityCredential(client_id=client_id)
+        logging.info("UAMI initialized")
 
-        # Step 2: Read and parse SQL connection string
-        conn_str = "Server=tcp:your-server.database.windows.net,1433;Database=metadata;Uid=your-username;Pwd=your-password;"
+        # DB connection (for local test only)
+        conn = pymssql.connect(
+            server='your-db-server.database.windows.net',
+            user='your-db-user',
+            password='your-db-password',
+            database='metadata'
+        )
 
-        def get_conn_value(key, source):
-            for part in source.split(";"):
-                if part.strip().lower().startswith(f"{key.lower()}="):
-                    return part.split("=", 1)[1].strip()
-            raise ValueError(f"Missing '{key}' in SQL connection string")
+        cursor = conn.cursor()
+        cursor.execute("SELECT mg_id FROM Management_Groups WHERE env_type = 'lower'")
+        rows = cursor.fetchall()
 
-        try:
-            server = get_conn_value("Server", conn_str).replace("tcp:", "").split(",")[0]
-            database = get_conn_value("Database", conn_str)
-            username = get_conn_value("Uid", conn_str)
-            password = get_conn_value("Pwd", conn_str)
-        except ValueError as parse_error:
-            logging.error(str(parse_error))
-            return func.HttpResponse(
-                json.dumps({"error": str(parse_error)}),
-                status_code=400
-            )
-
-        # Step 3: Connect to SQL DB using pymssql
-        with pymssql.connect(server=server, user=username, password=password, database=database) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT mg_id FROM Management_Groups WHERE env_type = 'lower'")
-            rows = cursor.fetchall()
+        if not rows:
+            return func.HttpResponse("No MGs found.", status_code=200)
 
         mg_ids = [row[0] for row in rows]
-        logging.info(f"✅ Retrieved {len(mg_ids)} management groups from DB")
-
-        # Step 4: Use UAMI to check access to MGs
-        valid_mgs = []
-        for mg_id in mg_ids:
-            try:
-                mg = mgmt_client.management_groups.get(group_id=mg_id)
-                valid_mgs.append({"mg_id": mg_id, "display_name": mg.display_name})
-            except Exception as e:
-                logging.warning(f"⛔ Cannot access MG '{mg_id}': {str(e)}")
-
-        return func.HttpResponse(
-            json.dumps({"status": "success", "mg_data": valid_mgs}, indent=2),
-            status_code=200,
-            mimetype="application/json"
-        )
+        logging.info(f"MGs fetched: {mg_ids}")
+        return func.HttpResponse(f"Management Groups: {mg_ids}", status_code=200)
 
     except Exception as e:
-        logging.error(f"Unhandled error: {e}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        logging.error(f"Error: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
