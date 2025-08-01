@@ -99,57 +99,68 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
 
         -------------
-
-
-
-
 import azure.functions as func
-import os
-import pymssql
-import json
 import logging
-
+import json
+import pymssql
+import os
+from azure.identity import ManagedIdentityCredential
+from azure.mgmt.managementgroups import ManagementGroupsAPI
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("🔍 Starting SQL connection test from Azure Function")
+    logging.info("Azure Function triggered – starting MG fetch with UAMI + DB.")
 
     try:
-        # Fetch the connection string from Azure Function App Settings (under Application Settings)
-        conn_str = os.getenv("SQL_CONNECTION_STRING")
+        # Step 1: Get UAMI client ID from environment and authenticate
+        uami_client_id = os.environ.get("UAMI_CLIENT_ID")
+        if not uami_client_id:
+            raise ValueError("UAMI_CLIENT_ID environment variable is not set")
+
+        credential = ManagedIdentityCredential(client_id=uami_client_id)
+        mgmt_client = ManagementGroupsAPI(credential)
+
+        # Step 2: Connect to Azure SQL using pymssql
+        conn_str = os.environ.get("SQL_CONN_STR")
         if not conn_str:
-            raise Exception("SQL_CONNECTION_STRING not found in environment variables")
+            raise ValueError("SQL_CONN_STR environment variable is not set")
 
-        # Parse the connection string manually
-        # Expected format: Server=tcp:<server>;Database=<db>;Uid=<user>;Pwd=<pass>;
-        parts = dict(item.split('=') for item in conn_str.split(';') if item)
-        server = parts.get("Server").replace("tcp:", "").strip()
-        database = parts.get("Database")
-        user = parts.get("Uid")
-        password = parts.get("Pwd")
+        # Parse connection string format: Server=...;Database=...;Uid=...;Pwd=...
+        parts = dict(item.split("=", 1) for item in conn_str.split(";") if item)
+        server = parts["Server"].replace("tcp:", "").replace(",", "")
+        database = parts["Database"]
+        user = parts["Uid"]
+        password = parts["Pwd"]
 
-        # Connect to SQL DB using pymssql
-        conn = pymssql.connect(server=server, user=user, password=password, database=database)
-        cursor = conn.cursor()
+        # Step 3: Fetch management groups from database
+        with pymssql.connect(server, user, password, database) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT mg_id FROM Management_Groups WHERE env_type = 'lower'")
+            rows = cursor.fetchall()
 
-        # Run query to fetch MGs
-        query = "SELECT mg_id FROM Managment_Groups WHERE env_type = 'lower';"
-        cursor.execute(query)
-        mg_ids = [row[0] for row in cursor.fetchall()]
+        mg_ids = [row[0] for row in rows]
+        logging.info(f"Retrieved {len(mg_ids)} management groups from DB")
 
-        cursor.close()
-        conn.close()
+        # Step 4: Validate access to each MG using UAMI
+        all_mgs = []
+        for mg_id in mg_ids:
+            try:
+                mg = mgmt_client.management_groups.get(group_id=mg_id)
+                all_mgs.append({"mg_id": mg_id, "display_name": mg.display_name})
+            except Exception as e:
+                logging.warning(f"Cannot access MG {mg_id}: {e}")
 
-        logging.info(f"✅ Successfully fetched {len(mg_ids)} management groups")
         return func.HttpResponse(
-            json.dumps({"mg_ids": mg_ids}, indent=2),
+            json.dumps({"status": "success", "mg_data": all_mgs}, indent=2),
             status_code=200,
             mimetype="application/json"
         )
 
     except Exception as e:
-        logging.error(f"❌ Error: {e}")
+        logging.error(f"Error occurred: {str(e)}")
         return func.HttpResponse(
             json.dumps({"error": str(e)}),
             status_code=500,
             mimetype="application/json"
         )
+
+
