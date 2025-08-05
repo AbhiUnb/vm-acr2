@@ -286,4 +286,128 @@ foreach ($sub in $allSubscriptions) {
         # Write-Output "VM found: $($vm.Name), Tags: $($vm.Tags | Out-String)"
         $tags = $vm.Tags
         $vmName = $vm.Name
+
+
+
+-----------
+import azure.functions as func
+import logging
+import json
+from azure.identity import AzureCliCredential
+from azure.monitor.query import MetricsQueryClient
+from datetime import datetime, timedelta
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.resource import SubscriptionClient
+import calendar
+from statistics import median
+from collections import defaultdict
+
+IDLE_HOURS = 4
+WINDOW_SIZE = int((IDLE_HOURS * 60) / 15)  # 4 hours = 16 samples
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Analyzing VM CPU usage for start/stop recommendations.')
+
+    try:
+        subscription_id = req.params.get('subscription_id')
+        days = int(req.params.get('days', 10))
+        if not subscription_id:
+            return func.HttpResponse("Missing 'subscription_id' query parameter", status_code=400)
+
+        credential = AzureCliCredential()
+        client = MetricsQueryClient(credential)
+        compute_client = ComputeManagementClient(credential, subscription_id)
+
+        vm_results = []
+
+        for vm in compute_client.virtual_machines.list_all():
+            if "aks" in vm.name.lower() or "databricks" in vm.name.lower():
+                continue
+
+            vm_resource_id = vm.id
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=days)
+
+            response = client.query_resource(
+                resource_uri=vm_resource_id,
+                metric_names=["Percentage CPU"],
+                timespan=(start_time, end_time),
+                granularity=timedelta(minutes=15)
+            )
+
+            cpu_values, timestamps = [], []
+
+            for metric in response.metrics:
+                if metric.name == "Percentage CPU":
+                    for ts in metric.timeseries:
+                        for point in ts.data:
+                            if point.average is not None:
+                                timestamps.append(point.timestamp.isoformat())
+                                cpu_values.append(point.average)
+
+            daily_data = defaultdict(list)
+            for i, cpu_val in enumerate(cpu_values):
+                date_key = timestamps[i][:10]
+                date_obj = datetime.strptime(date_key, "%Y-%m-%d")
+                if date_obj.weekday() < 5:
+                    daily_data[date_key].append({
+                        "timestamp": timestamps[i],
+                        "value": cpu_val
+                    })
+
+            daily_results = []
+            sorted_dates = sorted(daily_data.keys())
+
+            for date in sorted_dates:
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                entries = daily_data[date]
+                values = [e["value"] for e in entries]
+                times = [e["timestamp"] for e in entries]
+
+                if not values:
+                    continue
+
+                day_min_cpu = min(values)
+                day_max_cpu = max(values)
+                day_avg_cpu = sum(values) / len(values)
+
+                threshold = day_avg_cpu * 0.75  # dynamic threshold per day
+
+                spike_indexes = [i for i, val in enumerate(values) if val >= threshold]
+                if not spike_indexes:
+                    continue
+
+                first_spike = spike_indexes[0]
+                last_spike = spike_indexes[-1]
+
+                start_index = max(0, first_spike - 4)
+                stop_index = min(len(times) - 1, last_spike + 4)
+
+                daily_results.append({
+                    "date": date,
+                    "day": date_obj.strftime("%A"),
+                    "week": f"Week {(date_obj.day - 1) // 7 + 1} of {calendar.month_name[date_obj.month]}",
+                    "start_time": times[start_index],
+                    "stop_time": times[stop_index],
+                    "avg_cpu": round(day_avg_cpu, 2),
+                    "min_cpu": day_min_cpu,
+                    "max_cpu": day_max_cpu,
+                    "decision": "Safe to stop after last spike"
+                })
+
+            vm_results.append({
+                "name": vm.name,
+                "daily_recommendations": daily_results
+            })
+
+        return func.HttpResponse(
+            json.dumps(vm_results, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+
 		
