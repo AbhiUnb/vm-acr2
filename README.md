@@ -556,4 +556,92 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+
+--------
+from azure.identity import AzureCliCredential
+from azure.monitor.query import MetricsQueryClient
+from azure.mgmt.compute import ComputeManagementClient
+from datetime import datetime, timedelta
+
+credential = AzureCliCredential()
+metrics_client = MetricsQueryClient(credential)
+compute_client = ComputeManagementClient(credential, "<subscription_id>")  # replace with your sub ID
+
+end_time = datetime.utcnow()
+start_time = end_time - timedelta(days=30)
+
+# Thresholds
+CPU_THRESHOLD = 15.0
+MEMORY_THRESHOLD = 80.0  # Available memory in %
+NETWORK_THRESHOLD_MB = 10.0  # MB
+IOPS_THRESHOLD = 10.0  # %
+
+matching_vms = []
+
+for vm in compute_client.virtual_machines.list_all():
+    if "aks" in vm.name.lower() or "databricks" in vm.name.lower():
+        continue
+
+    resource_id = vm.id
+    response = metrics_client.query_resource(
+        resource_uri=resource_id,
+        metric_names=[
+            "Percentage CPU",
+            "Available Memory Bytes",
+            "Network In Total",
+            "Network Out Total",
+            "Used OS Disk IOPS",
+            "Used Data Disk IOPS"
+        ],
+        timespan=(start_time, end_time),
+        granularity=timedelta(hours=1),
+        aggregations=["Average"]
+    )
+
+    cpu_vals, mem_vals, net_vals, os_iops_vals, data_iops_vals = [], [], [], [], []
+
+    for metric in response.metrics:
+        for ts in metric.timeseries:
+            for point in ts.data:
+                if point.average is None:
+                    continue
+                if metric.name == "Percentage CPU":
+                    cpu_vals.append(point.average)
+                elif metric.name == "Available Memory Bytes":
+                    # Convert to percentage of 16 GB total (example, adjust to actual if known)
+                    mem_vals.append((point.average / (16 * 1024**3)) * 100)
+                elif metric.name in ["Network In Total", "Network Out Total"]:
+                    net_vals.append(point.average / (1024**2))  # Convert to MB
+                elif metric.name == "Used OS Disk IOPS":
+                    os_iops_vals.append(point.average)
+                elif metric.name == "Used Data Disk IOPS":
+                    data_iops_vals.append(point.average)
+
+    if not cpu_vals:
+        continue
+
+    avg_cpu = sum(cpu_vals) / len(cpu_vals)
+    avg_mem = sum(mem_vals) / len(mem_vals) if mem_vals else 0
+    avg_net = sum(net_vals) / len(net_vals) if net_vals else 0
+    avg_os_iops = sum(os_iops_vals) / len(os_iops_vals) if os_iops_vals else 0
+    avg_data_iops = sum(data_iops_vals) / len(data_iops_vals) if data_iops_vals else 0
+
+    if (
+        avg_cpu <= CPU_THRESHOLD and
+        avg_mem >= MEMORY_THRESHOLD and
+        avg_net < NETWORK_THRESHOLD_MB and
+        avg_os_iops < IOPS_THRESHOLD and
+        avg_data_iops < IOPS_THRESHOLD
+    ):
+        matching_vms.append({
+            "vm_name": vm.name,
+            "avg_cpu": round(avg_cpu, 2),
+            "avg_mem_percent": round(avg_mem, 2),
+            "avg_network_MB": round(avg_net, 2),
+            "avg_os_iops": round(avg_os_iops, 2),
+            "avg_data_iops": round(avg_data_iops, 2)
+        })
+
+print("Matching VMs:", matching_vms)
+
 		
