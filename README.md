@@ -644,4 +644,169 @@ for vm in compute_client.virtual_machines.list_all():
 
 print("Matching VMs:", matching_vms)
 
+
+------------
+
+import azure.functions as func
+import logging
+import json
+from azure.identity import AzureCliCredential
+from azure.monitor.query import MetricsQueryClient
+from datetime import datetime, timedelta
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.resource import SubscriptionClient
+import calendar
+
+IDLE_HOURS = 4
+WINDOW_SIZE = int((IDLE_HOURS * 60) / 15)
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Analyzing VM utilization for start/stop recommendations.')
+
+    try:
+        credential = AzureCliCredential()
+        sub_client = SubscriptionClient(credential)
+        client = MetricsQueryClient(credential)
+
+        subscription_id = req.params.get("subscription_id")
+        days = int(req.params.get("days", 7))
+
+        if not subscription_id:
+            return func.HttpResponse("Missing subscription_id in query parameters", status_code=400)
+
+        compute_client = ComputeManagementClient(credential, subscription_id)
+        vm_results = []
+
+        for vm in compute_client.virtual_machines.list_all():
+            if "aks" in vm.name.lower() or "databricks" in vm.name.lower():
+                continue
+
+            vm_resource_id = vm.id
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=days)
+
+            response = client.query_resource(
+                resource_uri=vm_resource_id,
+                metric_names=[
+                    "Percentage CPU",
+                    "Available Memory Bytes",
+                    "Network In Total",
+                    "Network Out Total",
+                    "OS Disk Read Bytes/sec",
+                    "OS Disk Write Bytes/sec"
+                ],
+                timespan=(start_time, end_time + timedelta(hours=1)),
+                granularity=timedelta(minutes=15)
+            )
+
+            cpu_values, disk_values, mem_values, net_values, timestamps = [], [], [], [], []
+            disk_reads, disk_writes = {}, {}
+            net_in, net_out = {}, {}
+            mem_avail = {}
+
+            for metric in response.metrics:
+                for ts in metric.timeseries:
+                    for point in ts.data:
+                        if point.average is None:
+                            continue
+                        ts_str = point.timestamp.isoformat()
+                        if metric.name == "Percentage CPU":
+                            timestamps.append(ts_str)
+                            cpu_values.append(point.average)
+                        elif metric.name == "Available Memory Bytes":
+                            mem_avail[ts_str] = point.average
+                        elif metric.name == "Network In Total":
+                            net_in[ts_str] = point.average
+                        elif metric.name == "Network Out Total":
+                            net_out[ts_str] = point.average
+                        elif metric.name == "OS Disk Read Bytes/sec":
+                            disk_reads[ts_str] = point.average
+                        elif metric.name == "OS Disk Write Bytes/sec":
+                            disk_writes[ts_str] = point.average
+
+            for ts in timestamps:
+                read_val = disk_reads.get(ts, 0)
+                write_val = disk_writes.get(ts, 0)
+                disk_values.append((read_val + write_val) / (1024 * 1024))  # MB
+
+                mem_val = mem_avail.get(ts, 0)
+                mem_values.append(mem_val / (1024 ** 3))  # GB
+
+                net_val = (net_in.get(ts, 0) + net_out.get(ts, 0)) / (1024 * 1024)  # MB
+                net_values.append(net_val)
+
+            from collections import defaultdict
+            daily_data = defaultdict(list)
+            for i, ts in enumerate(timestamps):
+                date_key = ts[:10]
+                date_obj = datetime.strptime(date_key, "%Y-%m-%d")
+                if date_obj.weekday() < 5:
+                    daily_data[date_key].append({
+                        "timestamp": ts,
+                        "cpu": cpu_values[i],
+                        "disk": disk_values[i] if i < len(disk_values) else 0,
+                        "mem": mem_values[i] if i < len(mem_values) else 0,
+                        "net": net_values[i] if i < len(net_values) else 0
+                    })
+
+            daily_results = []
+            for date in sorted(daily_data):
+                entries = daily_data[date]
+                if not entries:
+                    continue
+
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                if date_obj.weekday() >= 5:
+                    continue
+
+                values_cpu = [e["cpu"] for e in entries]
+                values_disk = [e["disk"] for e in entries]
+                values_mem = [e["mem"] for e in entries]
+                values_net = [e["net"] for e in entries]
+                ts_vals = [e["timestamp"] for e in entries]
+
+                busy_indexes = [
+                    i for i in range(len(entries))
+                    if values_cpu[i] > 15 or values_mem[i] < 1 or values_net[i] > 10 or values_disk[i] > 1
+                ]
+
+                if busy_indexes:
+                    first_idx = max(0, busy_indexes[0] - 4)
+                    last_idx = min(len(ts_vals) - 1, busy_indexes[-1] + 4)
+                    start_time = ts_vals[first_idx]
+                    stop_time = ts_vals[last_idx]
+                    decision = "Active VM. Consider scheduling around busy hours."
+                else:
+                    start_time = "No busy workload detected"
+                    stop_time = "No busy workload detected"
+                    decision = "Idle VM. Safe to stop."
+
+                daily_results.append({
+                    "date": date,
+                    "day": date_obj.strftime("%A"),
+                    "week": f"Week {(date_obj.day - 1) // 7 + 1} of {calendar.month_name[date_obj.month]}",
+                    "start_time": start_time,
+                    "stop_time": stop_time,
+                    "decision": decision
+                })
+
+            vm_results.append({
+                "name": vm.name,
+                "daily_recommendations": daily_results
+            })
+
+        return func.HttpResponse(
+            json.dumps(vm_results, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        return func.HttpResponse(
+            f"Error: {str(e)}",
+            status_code=500
+        )
+
 		
