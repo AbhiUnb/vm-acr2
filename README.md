@@ -967,3 +967,181 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             f"Error: {str(e)}",
             status_code=500
         )
+----------------
+import azure.functions as func
+import logging
+import json
+from azure.identity import AzureCliCredential
+from azure.monitor.query import MetricsQueryClient
+from datetime import datetime, timedelta
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.resource import SubscriptionClient
+import calendar
+from collections import defaultdict
+
+IDLE_HOURS = 4
+WINDOW_SIZE = int((IDLE_HOURS * 60) / 15)
+
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Analyzing VM resource usage for start/stop recommendations.')
+
+    try:
+        credential = AzureCliCredential()
+        sub_client = SubscriptionClient(credential)
+        client = MetricsQueryClient(credential)
+
+        subscription_id = req.params.get("subscription_id")
+        days = int(req.params.get("days", 7))
+
+        if not subscription_id:
+            return func.HttpResponse("Missing subscription_id in query parameters", status_code=400)
+
+        compute_client = ComputeManagementClient(credential, subscription_id)
+        vm_results = []
+
+        for vm in compute_client.virtual_machines.list_all():
+            if "aks" in vm.name.lower() or "databricks" in vm.name.lower():
+                continue
+
+            vm_resource_id = vm.id
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=days)
+
+            response = client.query_resource(
+                resource_uri=vm_resource_id,
+                metric_names=[
+                    "Percentage CPU",
+                    "Network In Total",
+                    "Network Out Total",
+                    "OS Disk IOPS Consumed Percentage",
+                    "Data Disk IOPS Consumed Percentage"
+                ],
+                timespan=(start_time, end_time + timedelta(hours=1)),
+                granularity=timedelta(minutes=15)
+            )
+
+            metrics_data = {
+                "cpu": [],
+                "network": [],
+                "os_iops": [],
+                "data_iops": [],
+                "timestamps": []
+            }
+
+            for metric in response.metrics:
+                for ts in metric.timeseries:
+                    for point in ts.data:
+                        if point.average is None:
+                            continue
+                        ts_str = point.timestamp.isoformat()
+                        if metric.name == "Percentage CPU":
+                            metrics_data["timestamps"].append(ts_str)
+                            metrics_data["cpu"].append(point.average)
+                        elif metric.name in ["Network In Total", "Network Out Total"]:
+                            index = metrics_data["timestamps"].index(ts_str) if ts_str in metrics_data["timestamps"] else None
+                            if index is not None:
+                                metrics_data["network"][index] += point.average / (1024 * 1024)
+                            else:
+                                metrics_data["timestamps"].append(ts_str)
+                                metrics_data["cpu"].append(0)
+                                metrics_data["network"].append(point.average / (1024 * 1024))
+                                metrics_data["os_iops"].append(0)
+                                metrics_data["data_iops"].append(0)
+                        elif metric.name == "OS Disk IOPS Consumed Percentage":
+                            metrics_data["os_iops"].append(point.average)
+                        elif metric.name == "Data Disk IOPS Consumed Percentage":
+                            metrics_data["data_iops"].append(point.average)
+
+            daily_data = defaultdict(list)
+            for i, ts in enumerate(metrics_data["timestamps"]):
+                date_key = ts[:10]
+                date_obj = datetime.strptime(date_key, "%Y-%m-%d")
+                if date_obj.weekday() < 5:
+                    daily_data[date_key].append({
+                        "timestamp": ts,
+                        "cpu": metrics_data["cpu"][i],
+                        "network": metrics_data["network"][i] if i < len(metrics_data["network"]) else 0,
+                        "os_iops": metrics_data["os_iops"][i] if i < len(metrics_data["os_iops"]) else 0,
+                        "data_iops": metrics_data["data_iops"][i] if i < len(metrics_data["data_iops"]) else 0
+                    })
+
+            daily_results = []
+            for date in sorted(daily_data):
+                entries = daily_data[date]
+                if not entries:
+                    continue
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                values = [e["cpu"] for e in entries]
+                network_vals = [e["network"] for e in entries]
+                os_iops_vals = [e["os_iops"] for e in entries]
+                data_iops_vals = [e["data_iops"] for e in entries]
+                ts_vals = [e["timestamp"] for e in entries]
+
+                busy_indexes = [
+                    i for i in range(len(values))
+                    if values[i] > 15 or
+                       network_vals[i] > 10 or
+                       os_iops_vals[i] > 10 or
+                       data_iops_vals[i] > 10
+                ]
+
+                if busy_indexes:
+                    first_idx = max(0, busy_indexes[0] - 4)
+                    last_idx = min(len(values) - 1, busy_indexes[-1] + 4)
+                    start_time = ts_vals[first_idx]
+                    stop_time = ts_vals[last_idx]
+                    start_cpu_avg = sum(values[first_idx:first_idx + 4]) / 4
+                    stop_cpu_avg = sum(values[max(0, last_idx - 4):last_idx]) / 4
+                    start_net_avg = sum(network_vals[first_idx:first_idx + 4]) / 4
+                    stop_net_avg = sum(network_vals[max(0, last_idx - 4):last_idx]) / 4
+                    start_os_iops = sum(os_iops_vals[first_idx:first_idx + 4]) / 4
+                    stop_os_iops = sum(os_iops_vals[max(0, last_idx - 4):last_idx]) / 4
+                    start_data_iops = sum(data_iops_vals[first_idx:first_idx + 4]) / 4
+                    stop_data_iops = sum(data_iops_vals[max(0, last_idx - 4):last_idx]) / 4
+                    decision = "Active VM. Consider scheduling around busy hours."
+                else:
+                    start_time = "No busy workload detected"
+                    stop_time = "No busy workload detected"
+                    start_cpu_avg = stop_cpu_avg = None
+                    start_net_avg = stop_net_avg = None
+                    start_os_iops = stop_os_iops = None
+                    start_data_iops = stop_data_iops = None
+                    decision = "Idle VM. Safe to stop."
+
+                logging.info(f"{vm.name} - {date}: Start={start_time}, Stop={stop_time}, Decision={decision}")
+
+                daily_results.append({
+                    "date": date,
+                    "day": date_obj.strftime("%A"),
+                    "week": f"Week {(date_obj.day - 1) // 7 + 1} of {calendar.month_name[date_obj.month]}",
+                    "start_time": start_time,
+                    "stop_time": stop_time,
+                    "start_window_cpu_usage": start_cpu_avg,
+                    "stop_window_cpu_usage": stop_cpu_avg,
+                    "start_window_network_MB": start_net_avg,
+                    "stop_window_network_MB": stop_net_avg,
+                    "start_window_os_iops": start_os_iops,
+                    "stop_window_os_iops": stop_os_iops,
+                    "start_window_data_iops": start_data_iops,
+                    "stop_window_data_iops": stop_data_iops,
+                    "decision": decision
+                })
+
+            vm_results.append({
+                "name": vm.name,
+                "daily_recommendations": daily_results
+            })
+
+        return func.HttpResponse(
+            json.dumps(vm_results, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        return func.HttpResponse(
+            f"Error: {str(e)}",
+            status_code=500
+        )
