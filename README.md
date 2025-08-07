@@ -1145,3 +1145,189 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             f"Error: {str(e)}",
             status_code=500
         )
+
+
+----------------------
+import azure.functions as func
+import logging
+import json
+from azure.identity import AzureCliCredential
+from azure.monitor.query import MetricsQueryClient
+from datetime import datetime, timedelta
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.resource import SubscriptionClient
+import calendar
+from collections import defaultdict
+
+IDLE_HOURS = 4
+WINDOW_SIZE = int((IDLE_HOURS * 60) / 15)
+INTERVALS_IN_1_HOUR = 4
+
+# Weights for composite score (must sum to 1.0)
+WEIGHTS = {
+    "cpu": 0.5,
+    "network": 0.2,
+    "os_iops": 0.15,
+    "data_iops": 0.15
+}
+
+# Thresholds for busy detection
+THRESHOLDS = {
+    "cpu": 15.0,
+    "network": 10.0,  # MB
+    "os_iops": 10.0,  # %
+    "data_iops": 10.0  # %
+}
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Analyzing VM resource usage using composite score for start/stop recommendations.')
+
+    try:
+        credential = AzureCliCredential()
+        sub_client = SubscriptionClient(credential)
+        client = MetricsQueryClient(credential)
+
+        subscription_id = req.params.get("subscription_id")
+        days = int(req.params.get("days", 7))
+
+        if not subscription_id:
+            return func.HttpResponse("Missing subscription_id in query parameters", status_code=400)
+
+        compute_client = ComputeManagementClient(credential, subscription_id)
+        vm_results = []
+
+        for vm in compute_client.virtual_machines.list_all():
+            if "aks" in vm.name.lower() or "databricks" in vm.name.lower():
+                continue
+
+            vm_resource_id = vm.id
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=days)
+
+            response = client.query_resource(
+                resource_uri=vm_resource_id,
+                metric_names=[
+                    "Percentage CPU",
+                    "Network In Total",
+                    "Network Out Total",
+                    "OS Disk IOPS Consumed Percentage",
+                    "Data Disk IOPS Consumed Percentage"
+                ],
+                timespan=(start_time, end_time + timedelta(hours=1)),
+                granularity=timedelta(minutes=15)
+            )
+
+            metrics_data = defaultdict(list)
+
+            for metric in response.metrics:
+                for ts in metric.timeseries:
+                    for point in ts.data:
+                        if point.average is None:
+                            continue
+                        ts_str = point.timestamp.isoformat()
+                        if ts_str not in metrics_data["timestamps"]:
+                            metrics_data["timestamps"].append(ts_str)
+
+                        idx = metrics_data["timestamps"].index(ts_str)
+
+                        if metric.name == "Percentage CPU":
+                            while len(metrics_data["cpu"]) <= idx:
+                                metrics_data["cpu"].append(0)
+                            metrics_data["cpu"][idx] = point.average
+
+                        elif metric.name == "Network In Total":
+                            while len(metrics_data["network_in"]) <= idx:
+                                metrics_data["network_in"].append(0)
+                            metrics_data["network_in"][idx] += point.average / (1024 * 1024)  # to MB
+
+                        elif metric.name == "Network Out Total":
+                            while len(metrics_data["network_out"]) <= idx:
+                                metrics_data["network_out"].append(0)
+                            metrics_data["network_out"][idx] += point.average / (1024 * 1024)
+
+                        elif metric.name == "OS Disk IOPS Consumed Percentage":
+                            while len(metrics_data["os_iops"]) <= idx:
+                                metrics_data["os_iops"].append(0)
+                            metrics_data["os_iops"][idx] = point.average
+
+                        elif metric.name == "Data Disk IOPS Consumed Percentage":
+                            while len(metrics_data["data_iops"]) <= idx:
+                                metrics_data["data_iops"].append(0)
+                            metrics_data["data_iops"][idx] = point.average
+
+            # Compute derived metrics
+            timestamps = metrics_data["timestamps"]
+            cpu_vals = metrics_data.get("cpu", [])
+            net_vals = [a + b for a, b in zip(metrics_data.get("network_in", [0]*len(cpu_vals)), metrics_data.get("network_out", [0]*len(cpu_vals)))]
+            os_vals = metrics_data.get("os_iops", [0]*len(cpu_vals))
+            data_vals = metrics_data.get("data_iops", [0]*len(cpu_vals))
+
+            # Compute busy scores and group by day
+            composite_scores = []
+            for i in range(len(cpu_vals)):
+                score = (
+                    (cpu_vals[i] / THRESHOLDS["cpu"]) * WEIGHTS["cpu"] +
+                    (net_vals[i] / THRESHOLDS["network"]) * WEIGHTS["network"] +
+                    (os_vals[i] / THRESHOLDS["os_iops"]) * WEIGHTS["os_iops"] +
+                    (data_vals[i] / THRESHOLDS["data_iops"]) * WEIGHTS["data_iops"]
+                )
+                composite_scores.append(score)
+
+            # Group by day
+            daily_data = defaultdict(list)
+            for i, ts in enumerate(timestamps):
+                date_key = ts[:10]
+                date_obj = datetime.strptime(date_key, "%Y-%m-%d")
+                if date_obj.weekday() < 5:
+                    daily_data[date_key].append({
+                        "timestamp": ts,
+                        "score": composite_scores[i],
+                        "cpu": cpu_vals[i],
+                        "network": net_vals[i],
+                        "os_iops": os_vals[i],
+                        "data_iops": data_vals[i]
+                    })
+
+            daily_results = []
+            for date in sorted(daily_data):
+                entries = daily_data[date]
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+
+                busy_indexes = [i for i, e in enumerate(entries) if e["score"] > 1.0]
+                if busy_indexes:
+                    start_idx = max(0, busy_indexes[0] - INTERVALS_IN_1_HOUR)
+                    stop_idx = min(len(entries) - 1, busy_indexes[-1] + INTERVALS_IN_1_HOUR)
+                    start_time = entries[start_idx]["timestamp"]
+                    stop_time = entries[stop_idx]["timestamp"]
+                    decision = "Start 1 hour before first spike, stop 1 hour after last."
+                else:
+                    start_time = "No major activity detected"
+                    stop_time = "No major activity detected"
+                    decision = "VM remained idle."
+
+                daily_results.append({
+                    "date": date,
+                    "day": date_obj.strftime("%A"),
+                    "week": f"Week {(date_obj.day - 1) // 7 + 1} of {calendar.month_name[date_obj.month]}",
+                    "start_time": start_time,
+                    "stop_time": stop_time,
+                    "decision": decision
+                })
+
+            vm_results.append({
+                "name": vm.name,
+                "daily_recommendations": daily_results
+            })
+
+        return func.HttpResponse(
+            json.dumps(vm_results, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        return func.HttpResponse(
+            f"Error: {str(e)}",
+            status_code=500
+        )
