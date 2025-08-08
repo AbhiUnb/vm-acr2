@@ -1339,7 +1339,7 @@ from azure.identity import AzureCliCredential
 from azure.monitor.query import MetricsQueryClient
 from datetime import datetime, timedelta
 from azure.mgmt.compute import ComputeManagementClient
-from azure.mgmt.resource import SubscriptionClient, ResourceManagementClient
+from azure.mgmt.resource import SubscriptionClient
 import calendar
 from collections import defaultdict
 
@@ -1361,21 +1361,6 @@ THRESHOLDS = {
     "data_iops": 10.0  # %
 }
 
-# --- NEW: Helper to read common owner-ish tags ---
-def get_it_owner_from_tags(tags: dict) -> str:
-    if not tags:
-        return None
-    candidates = [
-        "owner", "it_owner", "itowner", "application_owner", "app_owner",
-        "business_owner", "service_owner", "product_owner",
-        "managed-by", "managed_by", "itowneremail", "it_owner_email"
-    ]
-    lowered = {str(k).lower(): str(v).strip() for k, v in tags.items() if v is not None}
-    for key in candidates:
-        if key in lowered and lowered[key]:
-            return lowered[key]
-    return None
-
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Analyzing VM resource usage using composite score for start/stop recommendations.')
 
@@ -1391,26 +1376,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse("Missing subscription_id in query parameters", status_code=400)
 
         compute_client = ComputeManagementClient(credential, subscription_id)
-        # --- NEW: resource groups client for RG tags fallback ---
-        resource_client = ResourceManagementClient(credential, subscription_id)
-
         vm_results = []
 
         for vm in compute_client.virtual_machines.list_all():
             if "aks" in vm.name.lower() or "databricks" in vm.name.lower():
                 continue
 
-            # --- NEW: Resolve IT owner from VM tags, else RG tags ---
-            it_owner = get_it_owner_from_tags(getattr(vm, "tags", {}) or {})
-            # resource group name from resource ID: /subscriptions/.../resourceGroups/<rg>/providers/...
-            rg_name = vm.id.split("/")[4] if vm.id else None
-            if not it_owner and rg_name:
-                try:
-                    rg = resource_client.resource_groups.get(rg_name)
-                    it_owner = get_it_owner_from_tags(getattr(rg, "tags", {}) or {}) or "Unknown"
-                except Exception as ex:
-                    logging.warning(f"Could not read RG tags for {rg_name}: {ex}")
-                    it_owner = "Unknown"
+            # --- NEW: pull IT Owner tag from the VM (exact key: "IT Owner") ---
+            it_owner = vm.tags.get("IT Owner", "Not Assigned") if vm.tags else "Not Assigned"
 
             vm_resource_id = vm.id
             end_time = datetime.utcnow()
@@ -1527,13 +1500,20 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "week": f"Week {(date_obj.day - 1) // 7 + 1} of {calendar.month_name[date_obj.month]}",
                     "start_time": start_time_iso,
                     "stop_time": stop_time_iso,
-                    "decision": decision
+                    "decision": decision,
+                    "composite_scores": [{
+                        "timestamp": e["timestamp"],
+                        "score": round(e["score"], 2),
+                        "cpu": round(e["cpu"], 2),
+                        "network": round(e["network"], 2),
+                        "os_iops": round(e["os_iops"], 2),
+                        "data_iops": round(e["data_iops"], 2)
+                    } for e in entries]
                 })
 
             vm_results.append({
                 "name": vm.name,
-                "resource_group": rg_name,
-                "it_owner": it_owner or "Unknown",
+                "it_owner": it_owner,  # <- NEW FIELD
                 "daily_recommendations": daily_results
             })
 
